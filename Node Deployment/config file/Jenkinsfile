@@ -1,0 +1,165 @@
+def githash
+def DOCKER_IMAGE
+pipeline {
+    agent any
+
+    environment {
+        AWS_PROFILE = "sibasis"
+        S3_FOLDER = "sibasis-bucket"
+        
+    }
+
+    parameters {
+        gitParameter branchFilter: 'origin/(.*)', defaultValue: 'main', name: 'BRANCH', type: 'PT_BRANCH'
+        choice(name: 'ENVIRONMENT', choices: ['developement', 'production'], description: 'Choose the deployment environment') 
+    }
+
+    stages {
+
+        stage('preparation') {
+            steps {
+                script {
+                    try {
+                        cleanWs()
+                        withCredentials([string(credentialsId: 'ShareLib_Url', variable: 'ShareLib_Url')]) {
+                            library identifier: 'shared-lib@main', retriever: modernSCM([$class: 'GitSCMSource', credentialsId: 'gitlab-ssh-key', remote: "${ShareLib_Url}"])
+                        }
+                        download_file_from_s3("${params.ENVIRONMENT}.groovy", "${env.AWS_PROFILE}", "${env.S3_FOLDER}")
+                        load "./${params.ENVIRONMENT}.groovy"
+                    } catch (Exception e) {
+                        echo "Preparation failed: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('checkout') {
+            steps {
+                script {
+                    try {
+                        withCredentials([string(credentialsId: 'gitlb-url1', variable: 'REPO_URL')]) {
+                            git branch: "${params.BRANCH}", url: "${REPO_URL}", credentialsId: 'gitlab-ssh-key'
+                        }
+                        githash = sh(script: "git log -n 1 --pretty=format:'%H'", returnStdout: true).trim()
+                        DOCKER_IMAGE = "${env.JOB_NAME}--${env.ENVIRONMENT}:${githash}"
+                    }
+
+                    catch (Exception e) {
+                        echo "Failed to checkout the branch: ${params.BRANCH}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                    
+                }
+            }
+        }
+        
+        stage('static code analysis') {
+            steps {
+                script {
+                    try {
+                        if ("${params.ENVIRONMENT}" == "production") {
+                            staticCodeAnalysis()
+                        }
+                    } catch (Exception e) {
+                        echo "Static code analysis failed: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('building docker image') {
+            steps {
+                script {
+                    try {
+                        echo "Git Commit Hash: ${githash}"
+                        echo "Docker image tag: ${DOCKER_IMAGE}"
+                        
+                        if ("${params.ENVIRONMENT}" == "production")
+                        {
+                            dockerfile_path="${env.WORKSPACE}/Dockerfile "
+                            buildImage(DOCKER_IMAGE,dockerfile_path)
+                        } 
+                        else 
+                        {
+                            dockerfile_path="${env.WORKSPACE_PATH_JENKINS_SERVER}/DockerfileDev"
+                            buildImage(DOCKER_IMAGE,dockerfile_path)
+
+                        }
+
+                    } catch (Exception e) {
+                        echo "Docker build failed: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+            }
+        }
+
+        stage('pushing docker image') {
+            steps {
+                script {
+                    try {
+                        pushImage('dockerhub-credentials', DOCKER_IMAGE)
+                    } catch (Exception e) {
+                        echo "Docker login or push failed: ${e.getMessage()}"
+                        currentBuild.result = 'FAILURE'
+                        throw e
+                    }
+                }
+            }
+        }
+        
+        stage('Removing the Old Code') {
+            steps{
+                sshagent(['remote-server']) {
+                    script{
+                        try {
+                            removing_old_code()
+                        } catch(Exception e) {
+                            echo "Removing old code failed: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage("Transferring the Code") {
+            steps{
+                sshagent(['remote-server']) {
+                    script{
+                        try {
+                            transfer_code_to_server()
+                        } catch(Exception e) {
+                            echo "Transferring Code failed: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            throw e
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Restarting Application") {
+            steps{
+                sshagent(['remote-server']) {
+                    script{
+                        try {
+                            restartapp(githash, DOCKER_IMAGE,"${params.ENVIRONMENT}")
+                        } catch(Exception e) {
+                            echo "Restarting Application: ${e.getMessage()}"
+                            currentBuild.result = 'FAILURE'
+                            throw e
+                        }
+                    }   
+                }
+            }
+        }
+    }
+}
